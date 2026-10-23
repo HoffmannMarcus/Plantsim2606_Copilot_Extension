@@ -1,0 +1,6 @@
+name: example
+description: "Example custom tool package."
+triggers:
+  - example tool
+  - example topic
+always_on: false
