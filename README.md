@@ -1,6 +1,6 @@
 # Plant Simulation CoPilot — Skills & Custom Tools Extension
 
-This folder provides a drop-in replacement for Plant Simulation's `copilot_service.py` that adds local **Skills** (`/skills`, `/<skill-name>`) and **Custom Tool Packages** without requiring any external backend service.
+This folder provides a drop-in replacement for Plant Simulation's `copilot_service.py` that adds local **Skills** (`/skills`, `/<skill-name>`) and **Custom Tool Packages**.
 
 ## Installation (for Plant Simulation users)
 
