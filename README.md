@@ -1,6 +1,6 @@
 # Plant Simulation CoPilot — Skills & Custom Tools Extension
 
-This folder provides a drop-in replacement for Plant Simulation's `copilot_service.py` that adds local **Skills** (`/skills`, `/<skill-name>`) and **Custom Tool Packages**.
+This folder provides a drop-in replacement for Plant Simulation's `copilot_service.py` that adds local **Skills** (`/skills`, `/<skill-name>`) and **Custom Tool Packages** without requiring any external backend service.
 
 ## Installation (for Plant Simulation users)
 
@@ -16,13 +16,30 @@ This folder provides a drop-in replacement for Plant Simulation's `copilot_servi
    ```
 3. Restart Plant Simulation (or the CoPilot service).
 
-## Slash Commands in Chat
+## Skill Discoverability
 
-- `/skills` — Lists all **Available Skills** (`enabled: true`) and **Unavailable Skills** (`enabled: false`) with their descriptions.
-- `/<skill-name>` — Activates `<skill-name>` for subsequent messages in the conversation.
-- `/<skill-name> <prompt>` — Invokes `<skill-name>` for a single prompt without changing the active skill.
+Skills are discoverable across multiple channels:
 
-If you invoke a skill that has `enabled: false`, CoPilot replies with instructions on how to enable it in `skills/<skill-name>/SKILL.md`.
+1. **Auto-Discovery by the Agent (Tool-Like Progressive Loading):**
+   - The head (metadata frontmatter: name, description, tools) of each available skill is included in the agent's system prompt.
+   - The agent has access to the `load_skill` tool.
+   - When the LLM receives a user prompt and decides that a specialized skill is needed for the task, it calls `load_skill(skill_name="<name>")`.
+   - `load_skill` reads and loads the entire `SKILL.md` file into the conversation context as a tool output.
+   - Once a skill is loaded, any specialized custom tools declared in the skill's frontmatter (e.g., `tools: [example_tool]`) are automatically made visible to the model.
+
+2. **Model / Conversational Awareness:**
+   - Because the head of each skill is in the system prompt, if a user asks *"What skills do you have?"*, *"What can you do?"*, or *"Can you help with X?"*, the agent is aware of all registered skills and can explain their capabilities without needing manual slash commands.
+
+3. **HTTP API Discoverability:**
+   - `GET /skills` — Returns JSON containing `skills` (available), `unavailable_skills` (disabled), and `active_skill`. Useful for BrowserView, UI menus, and autocompletion.
+   - `GET /health` — Includes `skills_count` indicating how many active skills are registered.
+
+4. **Slash Commands in Chat (Manual Invocation):**
+   - `/skills` — Lists all **Available Skills** (`enabled: true`) and **Unavailable Skills** (`enabled: false`) with their descriptions.
+   - `/<skill-name>` — Activates `<skill-name>` for subsequent messages in the conversation.
+   - `/<skill-name> <prompt>` — Invokes `<skill-name>` for a single prompt without changing the active skill.
+
+If a skill has `enabled: false`, the service replies with instructions on how to enable it in `skills/<skill-name>/SKILL.md`.
 
 ## Adding a Skill
 

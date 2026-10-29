@@ -13,6 +13,7 @@ This service:
      - POST /query/stream   — SSE streaming (tokens streamed as they arrive)
      - POST /clear_memory   — clear conversation memory
      - GET  /health         — health check
+     - GET  /skills         — list available and unavailable skills
 """
 
 import logging
@@ -239,7 +240,13 @@ SYSTEM_PROMPT = (
     "- If the user greets you ('hello', 'hi', 'how are you'), respond briefly and professionally without using search tools\n"
     "- Quickly transition to asking how you can help with Plant Simulation or SimTalk questions\n"
     '- Example: "Hello! I\'m here to help with SimTalk programming and Plant Simulation questions. What would you like to know?"\n'
-    "- If the user asks about your capabilities or how you work, respond professionally with a brief overview\n"
+    "- If the user asks about your capabilities or how you work, respond professionally with a brief overview, including available specialized skills when present\n"
+    "\n"
+    "## Skills and Auto-Discovery\n"
+    "- You have access to specialized skills listed in the Skills section below (where their heads/metadata are defined).\n"
+    "- Auto-discovery: When a user's question or task relates to a specialized skill, decide whether to use it and call the `load_skill` tool with `skill_name` to load the entire skill file into context.\n"
+    "- Do not wait for the user to type a slash command. If an available skill is relevant, auto-discover it and load it using `load_skill`.\n"
+    "- When asked about your capabilities, what you can do, or what skills exist, describe the available skills from their heads.\n"
     "\n"
     "## Handling Ambiguous or Unclear Queries\n"
     "- If the user's question is too vague or lacks necessary context, ask for clarification BEFORE searching\n"
@@ -247,6 +254,7 @@ SYSTEM_PROMPT = (
     "- Keep clarification requests brief and friendly; only proceed with searches once you understand what the user needs\n"
     "\n"
     "## Tool Selection Guidelines\n"
+    "- **`load_skill`:** Load the complete instructions and context for a specialized skill when a user's request matches an available skill described in the Skills section. Call this before using any skill-specific instructions or tools.\n"
     "- **`search_chunks_semantic`:** For conceptual queries, discovering relevant functions, broad exploration. Use k=5-10. Best choice for non-English questions (handles cross-lingual queries).\n"
     "- **`search_chunks_keyword`:** For exact function names, specific API lookups, technical terms. Use k=3-5. **Only use with English queries** — the documentation index is English-only.\n"
     "- **`get_complete_documents`:** After finding relevant chunks, retrieve full documents for complete context. Request 3-5 documents.\n"
@@ -375,6 +383,7 @@ def _build_skill_prompt(messages: list) -> str:
         _system_prompt or _load_system_prompt(),
         messages,
         forced_skill=_effective_skill(),
+        include_catalog=True,
     )
 
 
@@ -1196,6 +1205,39 @@ def refactor_with_anonymous_identifiers(
     }
 
 
+@tool
+def load_skill(
+    skill_name: str,
+) -> str:
+    """Load the full instructions and context for a specialized skill.
+
+    Use this tool when you decide a user request or task matches an available skill
+    listed in the system prompt. This loads the entire skill file into context so you
+    can follow its detailed instructions and access any specialized tools it provides.
+
+    Args:
+        skill_name: The name of the skill to load (e.g. 'testskill').
+    """
+    global _active_skill
+    registry = _get_skill_registry()
+    key = registry._normalize_command(skill_name)
+    skill = registry.skills.get(key)
+    if skill is None:
+        available = [s.name for s in registry.available_skills()]
+        return f"Error: Skill '{skill_name}' not found. Available skills: {available}"
+    if not skill.enabled:
+        return (
+            f"Skill '{skill.name}' is not enabled. "
+            f"If you want to use it, set `enabled: true` in the `SKILL.md` file (`skills/{skill.name}/SKILL.md`)."
+        )
+    _active_skill = skill.name
+    try:
+        content = registry.read_file(skill)
+        return f"# Loaded Skill: {skill.name}\n\n{content}"
+    except Exception as e:
+        return f"Error loading skill '{skill.name}': {e}"
+
+
 # ---------------------------------------------------------------------------
 # MCP tools — only C++ runtime tools need cross-process MCP
 # ---------------------------------------------------------------------------
@@ -1251,7 +1293,13 @@ async def _reinitialize_agent():
         with StartupTimer("Import langchain.agents", _root_timer):
             from langchain.agents import create_agent
 
-        rag_tools = [search_chunks_semantic, search_chunks_keyword, get_complete_documents, refactor_with_anonymous_identifiers]
+        rag_tools = [
+            search_chunks_semantic,
+            search_chunks_keyword,
+            get_complete_documents,
+            refactor_with_anonymous_identifiers,
+            load_skill,
+        ]
         if _skill_registry is None:
             _skill_registry = SkillRegistry()
         _skill_registry.validate_names()
@@ -1280,7 +1328,13 @@ async def initialize():
         with StartupTimer("Register RAG tools", _root_timer):
             # RAG tools — direct Python, no network
             with StartupTimer("Define tool functions", _root_timer):
-                rag_tools = [search_chunks_semantic, search_chunks_keyword, get_complete_documents, refactor_with_anonymous_identifiers]
+                rag_tools = [
+                    search_chunks_semantic,
+                    search_chunks_keyword,
+                    get_complete_documents,
+                    refactor_with_anonymous_identifiers,
+                    load_skill,
+                ]
             logger.info(f"Registered {len(rag_tools)} local tools (in-process)")
 
         with StartupTimer("Load system prompt", _root_timer):
@@ -1411,12 +1465,50 @@ async def health():
     pending. The C++ BrowserView polls this endpoint and removes the loading overlay
     as soon as it sees status=ok, providing immediate UI feedback.
     """
+    skill_count = 0
+    try:
+        skill_count = len(_get_skill_registry().available_skills())
+    except Exception:
+        pass
     return {
         "status": "ok",
         "agent_ready": _agent is not None,
         "has_credentials": _has_credentials(),
-        "local_tools": 4,
+        "local_tools": 5,
         "mcp_tools": len(_mcp_tools),
+        "skills_count": skill_count,
+    }
+
+
+@app.get("/skills")
+async def get_skills():
+    """Return available and unavailable skills for UI / client discovery."""
+    try:
+        registry = _get_skill_registry()
+    except Exception as error:
+        return JSONResponse(status_code=500, content={"error": str(error)})
+    return {
+        "skills": [
+            {
+                "name": item.name,
+                "command": f"/{item.name}",
+                "description": item.description,
+                "enabled": item.enabled,
+                "tools": list(item.tools),
+            }
+            for item in registry.available_skills()
+        ],
+        "unavailable_skills": [
+            {
+                "name": item.name,
+                "command": f"/{item.name}",
+                "description": item.description,
+                "enabled": item.enabled,
+                "tools": list(item.tools),
+            }
+            for item in registry.unavailable_skills()
+        ],
+        "active_skill": _effective_skill(),
     }
 
 
@@ -1808,6 +1900,14 @@ async def query_stream(req: QueryRequest):
         langfuse_config["configurable"] = {"thread_id": _thread_id}
         skill_token = _skill_override.set(routed_skill_override)
         effective_skill_name = _effective_skill()
+        announced_skills: list[str] = []
+
+        if effective_skill_name and effective_skill_name not in announced_skills:
+            announced_skills.append(effective_skill_name)
+            skill_notice = f"*Loading skill {effective_skill_name}...*\n\n\n"
+            streamed_answer += skill_notice
+            yield {"event": "token", "data": skill_notice}
+
         try:
             with propagate_attributes(user_id=os.environ.get("LANGFUSE_USER_ID"), session_id=_thread_id):
                 async for msg, metadata in _agent.astream(
@@ -1820,6 +1920,14 @@ async def query_stream(req: QueryRequest):
                     # PLChat needs continuous streaming events for proper UI state management.
                     if isinstance(msg, AIMessage):
                         if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                if tc.get("name") in ("load_skill", "read_skill"):
+                                    s_name = tc.get("args", {}).get("skill_name") or tc.get("args", {}).get("name")
+                                    if s_name and s_name not in announced_skills:
+                                        announced_skills.append(s_name)
+                                        skill_notice = f"*Loading skill {s_name}...*\n\n\n"
+                                        streamed_answer += skill_notice
+                                        yield {"event": "token", "data": skill_notice}
                             # New tool-calling turn — reset the final turn accumulator
                             # (previous text was intermediate reasoning)
                             final_turn_answer = ""
@@ -1838,6 +1946,12 @@ async def query_stream(req: QueryRequest):
                                 final_turn_answer += text
                                 yield {"event": "token", "data": text}
                     elif isinstance(msg, ToolMessage):
+                        if getattr(msg, "name", None) in ("load_skill", "read_skill"):
+                            if _active_skill and _active_skill not in announced_skills:
+                                announced_skills.append(_active_skill)
+                                skill_notice = f"*Loading skill {_active_skill}...*\n\n\n"
+                                streamed_answer += skill_notice
+                                yield {"event": "token", "data": skill_notice}
                         # Tool result — reset accumulator (safety net)
                         final_turn_answer = ""
 
@@ -1859,6 +1973,13 @@ async def query_stream(req: QueryRequest):
         # from this field, replacing whatever was streamed. So the clean final answer
         # is what the user sees after rendering completes.
         final_response = final_turn_answer if final_turn_answer else streamed_answer
+        if announced_skills:
+            prefix = "".join(f"*Loading skill {s}...*\n\n\n" for s in announced_skills)
+            if not final_response.startswith(prefix):
+                final_response = prefix + final_response
+            if not effective_skill_name:
+                effective_skill_name = announced_skills[-1]
+
         tool_calls_count = 0
         tool_names = []
         total_input = 0
